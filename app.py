@@ -1,85 +1,61 @@
-import os
+# app.py
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
 import tensorflow as tf
 import numpy as np
 import librosa
 import tempfile
+import os
 import uvicorn
 from typing import Dict, Any
 import logging
 import soundfile as sf
 import wave
 import audioop
-import base64
 
-# Suppress TensorFlow warnings
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-tf.get_logger().setLevel(logging.ERROR)
+# Load environment variables
+load_dotenv()
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Initialize app
 app = FastAPI(title="Voice Emotion Recognition API")
 
-# Configure CORS for Vercel
+# Add CORS middleware - Updated for Vercel
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3000",
-        "https://localhost:3000", 
-        "https://*.vercel.app",
-        "https://mindbridge-alpha.vercel.app",  # Replace with your actual Vercel URL
-        "*"  # For development - remove in production
+        "https://mindbridge-alpha.vercel.app/",  # Replace with your actual Vercel URL
+        "https://*.vercel.app",  # Allow all Vercel subdomains
+        "http://localhost:3000",  # For local development
+        "https://localhost:3000",
     ],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
-# Global model variable
+# Load the model at startup
+model_path = "./model.keras"  # Ensure this file is in your repo
 model = None
-
-# Model path - Azure App Service will have the model in the root directory
-model_path = "./model.keras"
 
 @app.on_event("startup")
 async def startup_event():
     global model
     try:
-        # Check if model file exists
         if os.path.exists(model_path):
             model = tf.keras.models.load_model(model_path)
             logger.info(f"Model loaded successfully from {model_path}")
         else:
             logger.warning(f"Model file not found at {model_path}")
-            # Create a dummy model for testing if model not found
-            logger.info("Creating dummy model for testing...")
-            model = create_dummy_model()
     except Exception as e:
-        logger.error(f"Error loading model during startup: {e}")
-
-def create_dummy_model():
-    """Create a simple dummy model for testing when actual model is not available"""
-    try:
-        from tensorflow.keras.models import Sequential
-        from tensorflow.keras.layers import Dense, Input
-        
-        model = Sequential([
-            Input(shape=(40, 1)),
-            tf.keras.layers.Flatten(),
-            Dense(128, activation='relu'),
-            Dense(64, activation='relu'),
-            Dense(7, activation='softmax')  # 7 emotions
-        ])
-        model.compile(optimizer='adam', loss='categorical_crossentropy')
-        logger.info("Dummy model created successfully")
-        return model
-    except Exception as e:
-        logger.error(f"Failed to create dummy model: {e}")
-        return None
+        logger.error(f"Error loading model: {e}")
 
 def is_valid_wav(file_path):
     """Check if a WAV file is valid by trying to open it with wave"""
@@ -191,17 +167,17 @@ def extract_features(file_path, n_mfcc=40):
 @app.get("/")
 async def root():
     return {
-        "message": "Voice Emotion Recognition API is running on Azure App Service",
+        "message": "Voice Emotion Recognition API is running", 
         "status": "healthy",
         "model_loaded": model is not None
     }
 
+# Health check endpoint for Azure
 @app.get("/health")
 async def health_check():
     return {
         "status": "healthy",
-        "model_loaded": model is not None,
-        "service": "Voice Emotion Recognition API"
+        "model_loaded": model is not None
     }
 
 @app.exception_handler(Exception)
@@ -213,55 +189,45 @@ async def general_exception_handler(request: Request, exc: Exception):
     )
 
 @app.post("/predict")
-async def predict_emotion(
-    audio_file: UploadFile = File(...), 
-    expected_word: str = Form(None), 
-    category: str = Form(None),
-    return_audio: bool = Form(False)
-) -> Dict[str, Any]:
+async def predict_emotion(audio_file: UploadFile = File(...), expected_word: str = Form(None), category: str = Form(None)) -> Dict[str, Any]:
     global model
     
     logger.info(f"Received prediction request: file={audio_file.filename}, content_type={audio_file.content_type}")
-    logger.info(f"Parameters: expected_word={expected_word}, category={category}, return_audio={return_audio}")
+    logger.info(f"Parameters: expected_word={expected_word}, category={category}")
     
-    # Try to load model if not already loaded
     if model is None:
         try:
             logger.info(f"Attempting to load model from {model_path}")
             if os.path.exists(model_path):
                 model = tf.keras.models.load_model(model_path)
-                logger.info("Model loaded successfully")
             else:
-                logger.warning(f"Model file not found, using dummy model")
-                model = create_dummy_model()
-                if model is None:
-                    raise HTTPException(
-                        status_code=500, 
-                        detail="Could not create or load model"
-                    )
+                raise FileNotFoundError(f"Model file not found at {model_path}")
         except Exception as e:
             logger.error(f"Model could not be loaded: {str(e)}")
-            raise HTTPException(
-                status_code=500, 
-                detail=f"Model could not be loaded: {str(e)}"
-            )
+            return {
+                "filename": audio_file.filename,
+                "predicted_emotion": "neutral",
+                "confidence_scores": {
+                    "neutral": 1.0, "happy": 0.0, "sad": 0.0,
+                    "angry": 0.0, "fearful": 0.0, "disgust": 0.0, "surprised": 0.0
+                },
+                "text": "Model not available",
+                "error": str(e),
+                "matches": False
+            }
     
     valid_audio_types = [".wav", ".webm", ".mp3", ".ogg", ".m4a"]
     file_ext = os.path.splitext(audio_file.filename)[1].lower()
-    
-    if not file_ext and (audio_file.content_type == 'audio/webm' or 
-                        audio_file.content_type == 'video/webm'):
-        file_ext = '.webm'
     
     if not file_ext and audio_file.content_type == 'audio/wav':
         file_ext = '.wav'
     
     if not file_ext and not any(audio_file.content_type.startswith(f"audio/{t.replace('.', '')}") for t in valid_audio_types):
         logger.warning(f"Unsupported content type: {audio_file.content_type}")
-        file_ext = '.wav'  # Default to wav instead of webm
-    
-    temp_file_path = None
-    processed_wav_path = None
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type. Supported types: {', '.join(valid_audio_types)}"
+        )
     
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
@@ -271,20 +237,8 @@ async def predict_emotion(
         
         logger.info(f"Saved uploaded file to {temp_file_path}, size: {len(content)} bytes")
         
-        processing_file_path = temp_file_path
-        
-        if return_audio:
-            processed_wav_path = processing_file_path.replace(file_ext, '_processed.wav')
-            try:
-                audio_data, sample_rate = librosa.load(processing_file_path, sr=22050, mono=True)
-                sf.write(processed_wav_path, audio_data, sample_rate)
-                logger.info(f"Created processed WAV file: {processed_wav_path}")
-            except Exception as e:
-                logger.warning(f"Could not create processed WAV: {str(e)}")
-                processed_wav_path = None
-        
         try:
-            features = extract_features(processing_file_path)
+            features = extract_features(temp_file_path)
             features = np.expand_dims(features, axis=0)
             logger.info(f"Features extracted successfully, shape: {features.shape}")
         except Exception as e:
@@ -296,9 +250,9 @@ async def predict_emotion(
                     "neutral": 1.0, "happy": 0.0, "sad": 0.0,
                     "angry": 0.0, "fearful": 0.0, "disgust": 0.0, "surprised": 0.0
                 },
+                "text": "Could not process audio. Please try again and speak clearly.",
                 "error": str(e),
-                "matches": False,
-                "audio_base64": None
+                "matches": False
             }
         
         logger.info("Making prediction")
@@ -310,28 +264,12 @@ async def predict_emotion(
         
         logger.info(f"Prediction result: {emotions[predicted_label]}")
         
-        audio_base64 = None
-        if return_audio and processed_wav_path and os.path.exists(processed_wav_path):
-            try:
-                with open(processed_wav_path, 'rb') as f:
-                    audio_base64 = base64.b64encode(f.read()).decode('utf-8')
-                logger.info("Audio file encoded to base64")
-            except Exception as e:
-                logger.warning(f"Could not encode audio to base64: {str(e)}")
-        
-        # Cleanup
-        cleanup_files = [temp_file_path]
-        if processed_wav_path:
-            cleanup_files.append(processed_wav_path)
-        if os.path.exists(temp_file_path + '.fixed.wav'):
-            cleanup_files.append(temp_file_path + '.fixed.wav')
-            
-        for file_path in cleanup_files:
-            try:
-                if os.path.exists(file_path):
-                    os.unlink(file_path)
-            except Exception as e:
-                logger.warning(f"Could not delete temporary file {file_path}: {str(e)}")
+        try:
+            os.unlink(temp_file_path)
+            if os.path.exists(temp_file_path + '.fixed.wav'):
+                os.unlink(temp_file_path + '.fixed.wav')
+        except Exception as e:
+            logger.warning(f"Could not delete temporary file: {str(e)}")
         
         return {
             "filename": audio_file.filename,
@@ -340,22 +278,15 @@ async def predict_emotion(
                 emotions[i]: float(confidence_scores[i]) for i in range(len(emotions))
             },
             "text": "placeholder for transcription",
-            "matches": True if predicted_label == 0 else False,
-            "audio_base64": audio_base64
+            "matches": True if predicted_label == 0 else False
         }
         
     except Exception as e:
-        # Cleanup on error
-        cleanup_files = []
-        if temp_file_path:
-            cleanup_files.extend([temp_file_path, temp_file_path + '.fixed.wav'])
-        if processed_wav_path:
-            cleanup_files.append(processed_wav_path)
-            
-        for file_path in cleanup_files:
+        if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
             try:
-                if os.path.exists(file_path):
-                    os.unlink(file_path)
+                os.unlink(temp_file_path)
+                if os.path.exists(temp_file_path + '.fixed.wav'):
+                    os.unlink(temp_file_path + '.fixed.wav')
             except:
                 pass
         
@@ -367,13 +298,13 @@ async def predict_emotion(
                 "neutral": 1.0, "happy": 0.0, "sad": 0.0,
                 "angry": 0.0, "fearful": 0.0, "disgust": 0.0, "surprised": 0.0
             },
-            "text": "placeholder for transcription",
+            "text": "Error processing your speech. Please try again.",
             "error": str(e),
-            "matches": False,
-            "audio_base64": None
+            "matches": False
         }
 
-# For Azure App Service, we need to expose the app for gunicorn
-if __name__ == "__main__":
-    # This will only run when testing locally
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+# Azure App Service expects the app to be available as 'app'
+if __name__ == '__main__':
+    # Use PORT environment variable if available (Azure), otherwise default to 8000
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
